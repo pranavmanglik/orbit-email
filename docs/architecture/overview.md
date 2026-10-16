@@ -1,78 +1,71 @@
-# Orbit Email: architecture and boundaries
+# Orbit Email: architecture and contract boundaries
 
 ## Responsibility
 
-`orbit-email` provides a provider-neutral asynchronous message and sender contract. The package
-uses only Python's standard library and does not choose an SMTP server or email service:
+`orbit-email` defines bounded, immutable message values and an asynchronous sender protocol. It
+does not connect to a mail server, render templates, enqueue messages, or claim delivery. Provider
+adapters implement `EmailSender`; applications decide when to send, what to retry, and how to
+observe delivery outcomes.
 
-```bash
-python -m pip install orbit-email
+```text
+application ── builds EmailMessage ──> EmailSender
+                                      ├── SMTP/provider adapter
+                                      └── provider SDK, credentials, transport, lifecycle
 ```
 
-Build `EmailMessage` values from `EmailAddress` mailboxes, then pass them to an `EmailSender`
-adapter:
+The dependency direction is intentional: this capability package has no provider SDK dependency.
+Adapters may depend on `orbit-email`, but the capability must not import adapters or Core runtime
+implementation details.
 
-```python
-from orbit_email import EmailAddress, EmailMessage, EmailSender
+## Message values
 
-message = EmailMessage(
-    from_address=EmailAddress("receipts@example.com", display_name="Shop"),
-    to=(EmailAddress("customer@example.net"),),
-    subject="Your receipt",
-    text_body="Thank you for your order.",
-)
+- `EmailAddress` parses a mailbox through Python's standard `email.headerregistry.Address` type.
+  It validates syntax and bounded display-name/address input; it cannot establish that a mailbox
+  exists, accepts mail, or belongs to the caller.
+- `EmailMessage` requires at least one envelope recipient and at least one text or HTML body. It
+  normalizes recipient and attachment iterables to immutable tuples and bounds iteration before
+  materializing them, including for accidentally unbounded iterators.
+- `EmailAttachment` stores bytes in memory. Names are basenames; media types are syntactically
+  checked tokens. The package does not inspect file contents, detect malware, or prove that a MIME
+  type matches those contents.
+- `EmailSendReceipt` contains an optional opaque provider identifier. Its repr hides that value.
 
+Current defaults are 100 recipients across To/Cc/Bcc, 10 attachments, 10 MiB per body, 10 MiB per
+attachment, 20 MiB combined body and attachment bytes, and a 998-byte subject. These are API limits,
+not a guarantee that a provider accepts a message of that size. MIME/base64 encoding, provider
+limits, and transport overhead can make the transmitted request larger.
 
-async def deliver(sender: EmailSender) -> None:
-    try:
-        receipt = await sender.send(message)
-        print("accepted")
-    finally:
-        await sender.aclose()
-```
+Message reprs omit addresses, subjects, bodies, attachment filenames, and attachment bytes. This
+reduces accidental disclosure in routine diagnostics; it does not protect values explicitly read
+by application code, exception messages, tracing attributes, or provider SDK logs.
 
-`EmailAddress` uses Python's [`email.headerregistry.Address`](https://docs.python.org/3/library/email.headerregistry.html#email.headerregistry.Address)
-representation for Internet Message Format mailbox syntax and does not claim that a mailbox exists
-or can receive mail. Message subjects reject Unicode control characters, body
-size is bounded to 10 MiB, recipient count to 100, attachment count to 10, each attachment to
-10 MiB, and combined bodies plus attachments to 20 MiB. Attachment names cannot contain path
-separators or header controls. BCC recipients remain available in the envelope list; message,
-address, attachment, and receipt representations redact personal or message data.
-HTML bodies are transmitted as supplied and are not sanitized or rendered by this package; callers
-must apply their own content policy before sending untrusted HTML. Attachment bytes and media types
-are also caller-supplied and should be validated against application policy.
+## Sender lifecycle and errors
 
-Senders own provider SDKs, credentials, connections, retry policy, and shutdown. They must map
-provider failures to `EmailTemporaryError` or `EmailPermanentError` without including message
-content or recipient data in exception text, and propagate task cancellation. A temporary error
-does not prove the provider failed to accept the message: delivery may have succeeded before a
-timeout. The contract makes no exactly-once, idempotency, queueing, or delivery guarantee. Callers
-must choose retry behavior based on the adapter's documented provider semantics.
+`send()` performs one submission attempt. Implementations must not hide retries, must propagate
+async task cancellation, and must use `aclose()` to release resources they own. The adapter owns
+its SDK clients and connection pools; callers should stop new work, await or cancel in-flight work,
+then close the sender once during application shutdown. The protocol does not itself serialize
+concurrent calls or make `aclose()` safe to race with `send()`; adapters document and enforce their
+concurrency policy.
 
-This package includes no SMTP server, cloud email SDK, template rendering, tracking, queue, or
-provider adapter. The public API is pre-alpha and not stable.
+Adapters map failures to `EmailTemporaryError` or `EmailPermanentError`. The exception classes
+accept ordinary Python exception text and do not redact it. Adapter authors must construct
+bounded, safe messages and avoid recipient addresses, message content, credentials, and raw
+provider response bodies. Preserve the underlying exception as a chained cause only if doing so
+cannot expose sensitive SDK diagnostics through the application's logging and reporting path.
 
-## Declared dependencies
+An error is not proof that a provider rejected the message. A connection may time out after
+acceptance. Retrying can produce duplicates unless the provider supports an idempotency key and
+the adapter documents how it is applied. The generic contract has no idempotency key, exactly-once
+delivery, queue, ordering, persistence, or delivery-status callback.
 
-The following dependency declarations come from the checked-in manifests. Optional groups and development dependencies are called out separately.
+## Content and delivery policy
 
-### `pyproject.toml`
-- No dependencies declared.
-- Optional `dev` group: `pytest>=8,<10`, `pytest-asyncio>=0.24,<2`, `ruff>=0.8,<1`, `mypy>=1.13,<2`.
+The package does not sanitize HTML, validate sender-domain authorization (SPF/DKIM/DMARC), apply
+unsubscribe or consent policy, classify bounces, or rate-limit recipients. Applications and
+adapters must apply their relevant policy. Treat HTML, attachment content, recipient lists, and
+provider credentials as sensitive inputs. Do not use repr redaction as a substitute for access
+control or data-retention policy.
 
-Declared dependencies do not mean that optional providers or services are bundled with this package.
-
-## Implementation layout
-
-Representative implementation files in this checkout:
-
-- `src/orbit_email/__init__.py`
-- `src/orbit_email/message.py`
-
-## Public contract and scope
-
-The README does not contain a separately headed architecture section. Its responsibility statement above and the public source files define the implemented scope; this guide adds no behavior beyond that description.
-
-## Boundary rules
-
-Keep provider SDKs, credentials, transports, and provider-specific error translation in provider adapters. Keep reusable capability contracts in the matching capability package and lifecycle orchestration in Core. Apply the relevant layer for this repository and preserve the dependency direction shown above.
+The public API is alpha. Contract changes may occur before a stable release; adapters should
+pin compatible versions and test the specific provider behavior they depend on.

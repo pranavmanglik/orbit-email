@@ -1,67 +1,64 @@
-# Orbit Email: operations and security
+# Orbit Email: operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
+This guide describes operating the provider-neutral email contract. `orbit-email` contains no
+transport or provider client, so connection, timeout, retry, and provider quota settings belong to
+the selected adapter and must be checked in that adapter's documentation.
 
-## Configuration surface
+## Configuration and credentials
 
-Environment names found in the package README:
+The capability package defines no environment variables or configuration object. Configure the
+chosen adapter through the application's configuration system. Supply credentials through a
+secret manager or deployment secret mechanism; avoid command-line arguments, committed `.env`
+files, and logs. Use least-privilege credentials scoped to the sending identity and rotate them
+according to the provider's process.
 
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
+No default credentials are provided. Do not assume that installing `orbit-email` configures a
+working sender.
 
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
+## Constructing messages
 
-## Lifecycle, failure behavior, and limits
+All message bodies and attachment bytes are held in memory. Build messages only after applying
+application authorization and consent checks. The current bounds are 100 total recipients, 10
+attachments, 10 MiB for an individual text or HTML body, 10 MiB per attachment, and 20 MiB combined
+body and attachment bytes. The transport request may be larger due to MIME and base64 encoding;
+check the provider's request-size limit and leave headroom. These limits do not provide streaming
+or protect the application from constructing large source objects before calling the constructors.
 
-`orbit-email` provides a provider-neutral asynchronous message and sender contract. The package
-uses only Python's standard library and does not choose an SMTP server or email service:
+Send BCC recipients as envelope recipients while omitting them from visible message headers. The
+capability exposes `envelope_recipients` but does not serialize MIME or decide which headers an
+adapter emits. Adapter authors must preserve BCC privacy when translating a message to provider
+requests.
 
-```bash
-python -m pip install orbit-email
-```
+## Timeouts, retries, and duplicate delivery
 
-Build `EmailMessage` values from `EmailAddress` mailboxes, then pass them to an `EmailSender`
-adapter:
+The sender API makes one logical call and does not retry automatically. Set connection and request
+timeouts in the adapter and bound concurrent sends to match provider quotas and application
+capacity. A timeout or connection loss can occur after provider acceptance. Therefore:
 
-```python
-from orbit_email import EmailAddress, EmailMessage, EmailSender
+1. Classify a failure as temporary only when retrying could plausibly succeed.
+2. Do not interpret `EmailTemporaryError` as proof that no message was accepted.
+3. Use provider idempotency only where the adapter documents the exact key scope and retention.
+4. Apply bounded retry count, exponential backoff, and jitter in the application or a separately
+   chosen queue/worker system; the capability provides none of these.
+5. Record safe correlation identifiers and outcome state without recording bodies, credentials, or
+   recipient addresses in general-purpose logs.
 
-message = EmailMessage(
-    from_address=EmailAddress("receipts@example.com", display_name="Shop"),
-    to=(EmailAddress("customer@example.net"),),
-    subject="Your receipt",
-    text_body="Thank you for your order.",
-)
+`EmailPermanentError` signals that automatic retry is inappropriate without changing the input or
+policy. Provider-specific classification belongs to the adapter and can vary by API operation.
 
+## Shutdown and health
 
-async def deliver(sender: EmailSender) -> None:
-    try:
-        receipt = await sender.send(message)
-        print("accepted")
-    finally:
-        await sender.aclose()
-```
-
-`EmailAddress` uses Python's [`email.headerregistry.Address`](https://docs.python.org/3/library/email.headerregistry.html#email.headerregistry.Address)
-representation for Internet Message Format mailbox syntax and does not claim that a mailbox exists
-or can receive mail. Message subjects reject Unicode control characters, body
-size is bounded to 10 MiB, recipient count to 100, attachment count to 10, each attachment to
-10 MiB, and combined bodies plus attachments to 20 MiB. Attachment names cannot contain path
-separators or header controls. BCC recipients remain available in the envelope list; message,
-address, attachment, and receipt representations redact personal or message data.
-HTML bodies are transmitted as supplied and are not sanitized or rendered by this package; callers
-must apply their own content policy before sending untrusted HTML. Attachment bytes and media types
-are also caller-supplied and should be validated against application policy.
-
-Senders own provider SDKs, credentials, connections, retry policy, and shutdown. They must map
-provider failures to `EmailTemporaryError` or `EmailPermanentError` without including message
-content or recipient data in exception text, and propagate task cancellation. A temporary error
-does not prove the provider failed to accept the message: delivery may have succeeded before a
-timeout. The contract makes no exactly-once, idempotency, queueing, or delivery guarantee. Callers
-must choose retry behavior based on the adapter's documented provider semantics.
-
-This package includes no SMTP server, cloud email SDK, template rendering, tracking, queue, or
-provider adapter. The public API is pre-alpha and not stable.
+During graceful shutdown, stop accepting new application work, drain or cancel active send tasks
+within the deployment's shutdown deadline, then call `aclose()` on each owned sender. Implementors
+should make repeated close behavior explicit and ensure their SDK clients and network pools are
+released. The protocol does not prescribe a health check, readiness policy, or delivery probe; a
+successful connectivity check does not prove the sender identity is authorized or deliverable.
 
 ## Production validation
 
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+Before deployment, validate the chosen adapter against a non-production account: credential
+loading and rotation, TLS verification, sender-domain authorization, rate limits, request-size
+limits, timeout behavior after possible acceptance, cancellation, shutdown under active sends,
+provider error classification, and duplicate handling. Test bounce, complaint, suppression, and
+delivery-event processing separately if the application needs those capabilities. Local contract
+tests cannot verify provider acceptance or deliverability.

@@ -213,15 +213,24 @@ class EmailSendReceipt:
 
 
 class EmailSendError(Exception):
-    """Safe provider-neutral failure without addresses, message bodies, or SDK diagnostics."""
+    """Provider-neutral send failure.
+
+    The exception classes do not sanitize their message. Adapters must construct exception text
+    from safe, bounded diagnostics and must not include recipient addresses, message content,
+    credentials, or raw provider responses.
+    """
 
 
 class EmailTemporaryError(EmailSendError):
-    """A potentially transient delivery failure; retry safety depends on provider acceptance."""
+    """Potentially transient delivery failure.
+
+    A timeout can occur after a provider accepted a message. Retrying may therefore send a
+    duplicate unless the provider and adapter offer a documented idempotency mechanism.
+    """
 
 
 class EmailPermanentError(EmailSendError):
-    """A non-retryable delivery failure such as a rejected address or policy violation."""
+    """Non-retryable delivery failure, such as a rejected address or policy violation."""
 
 
 @runtime_checkable

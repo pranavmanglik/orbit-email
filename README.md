@@ -48,7 +48,7 @@ timeout. The contract makes no exactly-once, idempotency, queueing, or delivery 
 must choose retry behavior based on the adapter's documented provider semantics.
 
 This package includes no SMTP server, cloud email SDK, template rendering, tracking, queue, or
-provider adapter. The public API is pre-alpha and not stable.
+provider adapter. The public API is in alpha and not stable.
 
 ## Documentation
 
